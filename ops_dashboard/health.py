@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
-from report.series import trailing_sum
+from ops_dashboard.profile import FRESHNESS_SECONDS
+from ops_dashboard.series import trailing_sum
 
 RANK = {
     "healthy": 0,
@@ -15,6 +16,7 @@ RANK = {
     "critical": 4,
 }
 
+# Five-minute default. Callers running other bucket sizes pass profile.freshness.
 FRESHNESS_BUCKETS = 2
 
 
@@ -37,6 +39,11 @@ def freshest_index(values: Sequence[Optional[float]], freshness: int = FRESHNESS
         if values[index] is not None:
             return index
     return None
+
+
+def freshness_for(step: int) -> int:
+    """Buckets a sample may trail the window end and still count as current."""
+    return max(1, FRESHNESS_SECONDS // step)
 
 
 def _hits(value: float, limit: Optional[float], op: str) -> bool:
@@ -68,8 +75,10 @@ def evaluate_threshold(
     step: int,
     volume: Optional[Sequence[Optional[float]]] = None,
     min_volume: Optional[float] = None,
-    freshness: int = FRESHNESS_BUCKETS,
+    freshness: Optional[int] = None,
 ) -> Verdict:
+    if freshness is None:
+        freshness = freshness_for(step)
     index = freshest_index(values, freshness)
     window = freshness * step // 60
     if index is None:
@@ -91,7 +100,7 @@ def evaluate_threshold(
             return Verdict(
                 "unknown",
                 (
-                    f"{noun} is {format_value(value)} but the bucket has {shown}, "
+                    f"{noun} is {format_value(value)} but the window has {shown}, "
                     f"under the minimum of {int(min_volume)} requests, so it is unknown."
                 ),
                 threshold,
@@ -125,37 +134,49 @@ def evaluate_stall(
     step: int,
     noun: str = "CDC consumer",
 ) -> Verdict:
+    """Critical when messages arrived over the window and none were delivered.
+
+    The window ends at the newest bucket where both counts exist, because Azure Monitor
+    trails real time by a few minutes. A gap inside the window is unknown.
+    """
+    minutes = buckets * step // 60
+    rule = f"Critical when incoming > 0 and outgoing = 0 for {minutes} minutes."
     if len(incoming) < buckets or len(outgoing) < buckets:
         return Verdict("unknown", f"{noun} stall inputs are shorter than {buckets} buckets.", None, None, "cdcStall", None)
-    inn = list(incoming[-buckets:])
-    out = list(outgoing[-buckets:])
-    epoch = start + (len(incoming) - 1) * step
+    anchor = None
+    limit = min(len(incoming), len(outgoing))
+    for index in range(limit - 1, max(-1, limit - 1 - freshness_for(step)), -1):
+        if incoming[index] is not None and outgoing[index] is not None:
+            anchor = index
+            break
+    if anchor is None or anchor + 1 < buckets:
+        anchor = limit - 1
+    epoch = start + anchor * step
+    inn = list(incoming[anchor + 1 - buckets : anchor + 1])
+    out = list(outgoing[anchor + 1 - buckets : anchor + 1])
     if any(value is None for value in inn + out):
         return Verdict(
             "unknown",
-            f"{noun} is unknown because part of the last {buckets * step // 60} minutes has no Service Bus sample.",
-            "Critical when incoming > 0 and outgoing = 0 for 15 minutes on data-changes.",
+            f"{noun} is unknown because part of the last {minutes} minutes has no Service Bus sample.",
+            rule,
             epoch,
             "cdcStall",
             None,
         )
-    stalled = all(float(left) > 0 and float(right) <= 0 for left, right in zip(inn, out))
+    stalled = sum(float(value) for value in inn) > 0 and sum(float(value) for value in out) <= 0
     if stalled:
         return Verdict(
             "critical",
-            (
-                f"{noun} is critical: data-changes received messages and delivered none "
-                f"for {buckets * step // 60} minutes."
-            ),
-            "Critical when incoming > 0 and outgoing = 0 for 15 minutes.",
+            f"{noun} is critical: data-changes received messages and delivered none for {minutes} minutes.",
+            rule,
             epoch,
             "cdcStall",
             1.0,
         )
     return Verdict(
         "healthy",
-        f"{noun} is not stalled over the last {buckets * step // 60} minutes.",
-        "Critical when incoming > 0 and outgoing = 0 for 15 minutes.",
+        f"{noun} is not stalled over the last {minutes} minutes.",
+        rule,
         epoch,
         "cdcStall",
         0.0,
@@ -259,12 +280,19 @@ def evaluate_level_window(
     )
 
 
-def evaluate_unthresholded(values: Sequence[Optional[float]], *, noun: str, metric: str, freshness: int = FRESHNESS_BUCKETS) -> Verdict:
+def evaluate_unthresholded(
+    values: Sequence[Optional[float]],
+    *,
+    noun: str,
+    metric: str,
+    freshness: int = FRESHNESS_BUCKETS,
+    step: int = 300,
+) -> Verdict:
     index = freshest_index(values, freshness)
     if index is None:
         return Verdict(
             "unknown",
-            f"{noun} has no sample in the last {freshness * 5} minutes, and no scoring threshold is configured.",
+            f"{noun} has no sample in the last {freshness * step // 60} minutes, and no scoring threshold is configured.",
             "No scoring threshold is configured.",
             None,
             metric,

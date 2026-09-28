@@ -1,5 +1,5 @@
-from report.logs_parse import request_series
-from report.series import aggregate_request_buckets, failure_rates
+from ops_dashboard.logs_parse import request_series
+from ops_dashboard.series import aggregate_request_buckets, failure_rates
 
 
 def test_sampled_counts_sum_item_count_not_rows():

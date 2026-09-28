@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
-from report.series import PointMap
+from ops_dashboard.series import PointMap
 
 _FIELDS = {
     "Average": "average",

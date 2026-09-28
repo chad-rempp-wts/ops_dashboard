@@ -1,5 +1,6 @@
 'use strict';
-var REPORT = JSON.parse(document.getElementById('report-data').textContent);
+var REPORT = null;
+var busyUntil = 0;
 
 const PT_FMT = new Intl.DateTimeFormat('en-US', {
   timeZone: 'America/Los_Angeles',
@@ -104,6 +105,8 @@ var pinnedId = '';
 
 function yOf(v, yMax) {
   if (!yMax) return TOP + PLOT_H;
+  if (v > yMax) v = yMax;
+  if (v < 0) v = 0;
   return TOP + (1 - v / yMax) * PLOT_H;
 }
 function xOf(i, n) {
@@ -111,6 +114,9 @@ function xOf(i, n) {
 }
 function xml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+}
+function touch() {
+  busyUntil = Date.now() + 8000;
 }
 function mountChart(plot) {
   var id = plot.getAttribute('data-chart');
@@ -145,11 +151,16 @@ function mountChart(plot) {
     markup += '<line class="thr-' + thr.kind + '" x1="' + LEFT + '" x2="' + (LEFT + PLOT_W) + '" y1="' + ty.toFixed(1) + '" y2="' + ty.toFixed(1) + '"></line>';
   }
   var epoch0 = REPORT.start;
+  var shortSpan = n * REPORT.step <= 2 * 86400;
   for (var i = 0; i < n; i++) {
     var p = ptParts(epoch0 + i * REPORT.step);
-    if (p.hour === '00' && p.minute === '00') {
-      markup += '<text class="xlab" x="' + xOf(i, n).toFixed(1) + '" y="' + (HEIGHT - 8) + '" text-anchor="middle">' + xml(p.month + ' ' + Number(p.day)) + '</text>';
-    }
+    if (p.minute !== '00') continue;
+    var label = '';
+    if (p.hour === '00') label = p.month + ' ' + Number(p.day);
+    else if (shortSpan && Number(p.hour) % 3 === 0) label = p.hour + ':00';
+    if (!label) continue;
+    if (i === 0 || i === n - 1) continue;
+    markup += '<text class="xlab" x="' + xOf(i, n).toFixed(1) + '" y="' + (HEIGHT - 8) + '" text-anchor="middle">' + xml(label) + '</text>';
   }
   markup += '<line class="probe" x1="0" x2="0" y1="' + TOP + '" y2="' + (TOP + PLOT_H) + '"></line>';
   markup += '<circle class="dot-a" r="3.5" cx="0" cy="0"></circle>';
@@ -159,6 +170,10 @@ function mountChart(plot) {
   var probe = svg.querySelector('.probe');
   var dots = [svg.querySelector('.dot-a'), svg.querySelector('.dot-b')];
   var idx = n - 1;
+  var lead = chart.series[0] ? REPORT.series[chart.series[0].key] : null;
+  while (lead && idx > 0 && lead[idx] == null) idx--;
+  var initial = lead && lead[idx] != null ? idx : n - 1;
+  idx = initial;
   function show(index) {
     idx = index;
     var x = xOf(index, n);
@@ -186,13 +201,15 @@ function mountChart(plot) {
     return i;
   }
   svg.addEventListener('pointermove', function (event) {
+    touch();
     var rect = svg.getBoundingClientRect();
     if (!rect.width) return;
     var x = ((event.clientX - rect.left) / rect.width) * WIDTH;
     show(indexAt(x));
   });
   plot.addEventListener('keydown', function (event) {
-    var step = event.shiftKey ? 12 : 1;
+    touch();
+    var step = event.shiftKey ? (REPORT.hour || 12) : 1;
     var next = idx;
     if (event.key === 'ArrowRight') next = Math.min(n - 1, idx + step);
     else if (event.key === 'ArrowLeft') next = Math.max(0, idx - step);
@@ -202,7 +219,7 @@ function mountChart(plot) {
     event.preventDefault();
     show(next);
   });
-  show(n - 1);
+  show(initial);
 }
 function drawLinks() {
   var root = document.querySelector('.board');
@@ -276,29 +293,55 @@ function syncSelection() {
 }
 function setView(view) {
   document.body.setAttribute('data-view', view);
-  document.getElementById('show-map').setAttribute('aria-pressed', view === 'map' ? 'true' : 'false');
-  document.getElementById('show-list').setAttribute('aria-pressed', view === 'list' ? 'true' : 'false');
+  var map = document.getElementById('show-map');
+  var list = document.getElementById('show-list');
+  if (map) map.setAttribute('aria-pressed', view === 'map' ? 'true' : 'false');
+  if (list) list.setAttribute('aria-pressed', view === 'list' ? 'true' : 'false');
   window.requestAnimationFrame(drawLinks);
 }
-document.getElementById('show-map').addEventListener('click', function () { setView('map'); });
-document.getElementById('show-list').addEventListener('click', function () { setView('list'); });
-document.getElementById('theme').addEventListener('click', function () {
-  var root = document.documentElement;
-  var light = root.getAttribute('data-theme') !== 'light';
-  root.setAttribute('data-theme', light ? 'light' : 'dark');
+function syncTheme() {
+  var light = document.documentElement.getAttribute('data-theme') === 'light';
   var btn = document.getElementById('theme');
+  if (!btn) return;
   btn.setAttribute('aria-pressed', light ? 'true' : 'false');
   btn.textContent = light ? 'Switch to dark mode' : 'Switch to light mode';
+}
+function mountAll() {
+  REPORT = JSON.parse(document.getElementById('report-data').textContent);
+  hoverId = '';
+  var plots = document.querySelectorAll('.plot');
+  for (var pi = 0; pi < plots.length; pi++) mountChart(plots[pi]);
+  setView(document.body.getAttribute('data-view') || 'map');
+  syncTheme();
+  syncSelection();
+}
+function isBusy() {
+  var active = document.activeElement;
+  if (active && active.classList && active.classList.contains('plot')) return true;
+  return Date.now() < busyUntil;
+}
+
+document.body.addEventListener('click', function (event) {
+  var target = event.target;
+  if (!target.closest) return;
+  if (target.closest('#show-map')) { setView('map'); return; }
+  if (target.closest('#show-list')) { setView('list'); return; }
+  if (target.closest('#theme')) {
+    var root = document.documentElement;
+    root.setAttribute('data-theme', root.getAttribute('data-theme') !== 'light' ? 'light' : 'dark');
+    syncTheme();
+    return;
+  }
+  if (target.closest('a[href^="#"]')) window.setTimeout(syncSelection, 0);
 });
-var plots = document.querySelectorAll('.plot');
-for (var pi = 0; pi < plots.length; pi++) mountChart(plots[pi]);
-var board = document.querySelector('.board');
-board.addEventListener('mouseover', function (event) {
+document.body.addEventListener('mouseover', function (event) {
+  if (!event.target.closest || !event.target.closest('.board')) return;
   var node = event.target.closest('[data-id]');
   var id = node ? node.getAttribute('data-id') : '';
   if (id !== hoverId) { hoverId = id; drawLinks(); }
 });
-board.addEventListener('mouseout', function (event) {
+document.body.addEventListener('mouseout', function (event) {
+  if (!event.target.closest || !event.target.closest('.board')) return;
   var node = event.target.closest('[data-id]');
   if (!node) return;
   var next = event.relatedTarget && event.relatedTarget.closest ? event.relatedTarget.closest('[data-id]') : null;
@@ -308,11 +351,20 @@ board.addEventListener('mouseout', function (event) {
 });
 window.addEventListener('hashchange', syncSelection);
 window.addEventListener('resize', drawLinks);
-if (window.ResizeObserver) new ResizeObserver(drawLinks).observe(board);
 window.matchMedia('(max-width: 1100px)').addEventListener('change', drawLinks);
-syncSelection();
-document.body.addEventListener('click', function (event) {
-  var link = event.target.closest('a[href^="#"]');
-  if (!link) return;
-  window.setTimeout(syncSelection, 0);
-});
+
+var boardObserver = null;
+function observeBoard() {
+  if (!window.ResizeObserver) return;
+  if (boardObserver) boardObserver.disconnect();
+  var board = document.querySelector('.board');
+  if (!board) return;
+  boardObserver = new ResizeObserver(drawLinks);
+  boardObserver.observe(board);
+}
+
+window.OpsDashboard = {
+  mount: function () { mountAll(); observeBoard(); },
+  isBusy: isBusy
+};
+window.OpsDashboard.mount();

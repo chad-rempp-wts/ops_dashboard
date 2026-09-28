@@ -1,4 +1,4 @@
-from report.metrics_parse import parse_metric_payload
+from ops_dashboard.metrics_parse import parse_metric_payload
 
 
 def test_average_is_not_replaced_by_total():

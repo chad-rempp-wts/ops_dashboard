@@ -79,3 +79,6 @@ class Report:
     data_quality: List[str] = field(default_factory=list)
     absent_notes: List[str] = field(default_factory=list)
     maintenance_note: str = ""
+    profile: str = "snapshot"
+    # Newest bucket in any Azure Monitor metric series. Shows how far Azure trails the window end.
+    latest_sample: Optional[int] = None

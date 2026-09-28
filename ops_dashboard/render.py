@@ -1,42 +1,74 @@
-"""Standalone HTML renderer. The page inlines CSS, script, and data."""
+"""HTML renderer. The snapshot page inlines CSS, script, and data and needs no network.
+
+Live pages add one more inline script that polls the local server. That script is not
+present in the snapshot file, so the file uploaded to Blob Storage never makes a request.
+"""
 
 from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from html import escape
 from pathlib import Path
 
-from report.health import RANK
-from report.icons import LABELS, badge_svg, icon_svg
-from report.model import ChartView, ComponentView, Report
-from report.window import format_pt, format_pt_date, format_pt_long, iso_utc
+from ops_dashboard import catalog
+from ops_dashboard.format import format_number
+from ops_dashboard.health import RANK
+from ops_dashboard.icons import LABELS, badge_svg, icon_svg
+from ops_dashboard.model import ChartView, ComponentView, Report
+from ops_dashboard.profile import FRESHNESS_SECONDS, PROFILES
+from ops_dashboard.window import format_pt, format_pt_date, format_pt_long, iso_utc
 
 _ASSETS = Path(__file__).parent / "assets"
 _ID = re.compile(r"^[A-Za-z0-9-]+$")
 _STATE_ORDER = ("critical", "degraded", "unknown", "maintenance", "healthy")
+PRODUCT = "Ops dashboard"
 
 
-def render_html(report: Report) -> str:
+@dataclass(frozen=True)
+class Parts:
+    """Everything that changes between refreshes: the visible body and the chart data."""
+
+    title: str
+    body: str
+    payload: dict
+
+
+def render_parts(report: Report) -> Parts:
+    day = format_pt_date(report.window_end)
+    return Parts(
+        title=f"{PRODUCT} — Production — {day}",
+        body=_body(report),
+        payload=_chart_payload(report),
+    )
+
+
+def render_html(report: Report, *, live: bool = False, version: str = "") -> str:
+    return page(render_parts(report), live=live, version=version)
+
+
+def page(parts: Parts, *, live: bool = False, version: str = "") -> str:
     css = (_ASSETS / "report.css").read_text(encoding="utf-8")
     script = (_ASSETS / "report.js").read_text(encoding="utf-8")
-    day = format_pt_date(report.window_end)
-    title = f"Daily systems report — Production — {day}"
-    payload = _chart_payload(report)
-    body = _body(report)
+    live_script = ""
+    if live:
+        live_script = f"<script>\n{(_ASSETS / 'live.js').read_text(encoding='utf-8')}</script>\n"
+    mode = "live" if live else "snapshot"
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en" data-theme="dark">\n'
         "<head>\n"
         '<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
-        f"<title>{_text(title)}</title>\n"
+        f"<title>{_text(parts.title)}</title>\n"
         f"<style>\n{css}</style>\n"
         "</head>\n"
-        '<body data-view="map">\n'
-        f"{body}\n"
-        f'<script type="application/json" id="report-data">{_json(payload)}</script>\n'
+        f'<body data-view="map" data-mode="{mode}" data-version="{_attr(version)}">\n'
+        f'<div id="app">{parts.body}</div>\n'
+        f'<script type="application/json" id="report-data">{_json(parts.payload)}</script>\n'
         f"<script>\n{script}</script>\n"
+        f"{live_script}"
         "</body>\n"
         "</html>\n"
     )
@@ -46,7 +78,7 @@ def write_report(report: Report, out_dir: Path) -> tuple[Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     html = render_html(report)
     day = format_pt_date(report.window_end)
-    dated = out_dir / f"daily-report-{day}.html"
+    dated = out_dir / f"ops-dashboard-{day}.html"
     latest = out_dir / "latest.html"
     dated.write_text(html, encoding="utf-8")
     latest.write_text(html, encoding="utf-8")
@@ -54,37 +86,58 @@ def write_report(report: Report, out_dir: Path) -> tuple[Path, Path]:
 
 
 def _body(report: Report) -> str:
+    profile = PROFILES[report.profile]
     scored = [item for item in report.components if item.on_map]
     counts = {state: 0 for state in _STATE_ORDER}
     for item in scored:
         counts[item.state] = counts.get(item.state, 0) + 1
-    kind = "Fixture" if report.fixture else "Live"
-    lede = (
-        "Fixture data for an offline demo. Health rules match the live report. "
-        "Unthresholded components stay unknown. The maintenance state on the data-change tracker is illustrative."
-        if report.fixture
-        else "Read-only production measurements. Each run queries Azure and writes this file. Nothing is stored between runs."
+    if report.fixture:
+        kind = "Fixture"
+        lede = (
+            "Fixture data for an offline demo. Health rules match the live report. "
+            "Unthresholded components stay unknown. The maintenance state on the data-change tracker is illustrative."
+        )
+    elif profile.live:
+        kind = "Live"
+        lede = (
+            f"Read-only production measurements at {profile.bucket_label} resolution for the last {profile.span_label}. "
+            "A local server queries Azure every minute and this page follows it."
+        )
+    else:
+        kind = "Snapshot"
+        lede = "Read-only production measurements. Each run queries Azure and writes this file. Nothing is stored between runs."
+    latest = (
+        f"<li>Latest Azure sample {_text(format_pt(report.latest_sample))}</li>"
+        if report.latest_sample is not None
+        else ""
+    )
+    pill = (
+        '<span id="live-pill" class="live-pill" data-state="connecting">Connecting</span>'
+        if profile.live
+        else ""
     )
     parts = [
         '<a class="skip" href="#summary">Skip to summary</a>',
         '<header class="top"><div class="top-inner">',
-        '<p class="product">Daily systems report</p>',
+        f'<p class="product">{PRODUCT}</p>',
         f'<p class="top-meta">{_text(kind)} · Production · {format_pt_date(report.window_end)}</p>',
+        pill,
         '<button type="button" id="theme" aria-pressed="false">Switch to light mode</button>',
         "</div></header>",
         "<main>",
-        "<h1>Daily systems report</h1>",
+        f"<h1>{PRODUCT}</h1>",
         f'<p class="lede">{_text(lede)} Environment: Production. Generated {_text(format_pt(report.generated_epoch))}.</p>',
         '<ul class="chips">',
         f"<li>{_text(kind)}</li><li>Production</li>",
         f"<li>Generated {_text(format_pt_date(report.generated_epoch))}</li>",
-        f"<li>{report.count:,} five-minute buckets</li>",
+        f"<li>{report.count:,} {_text(profile.bucket_label)} buckets</li>",
+        latest,
         "</ul>",
         (
             f'<p class="window">Window <time datetime="{iso_utc(report.window_start)}">'
             f"{_text(format_pt(report.window_start))}</time> through "
             f'<time datetime="{iso_utc(report.window_end)}">{_text(format_pt(report.window_end))}</time>'
-            f" · {report.count:,} five-minute buckets · America/Los_Angeles</p>"
+            f" · {report.count:,} {_text(profile.bucket_label)} buckets · America/Los_Angeles</p>"
         ),
         '<noscript><p class="noscript">Charts and dependency lines use the script in this file. The page does not load anything from the network.</p></noscript>',
         _summary(counts),
@@ -95,7 +148,7 @@ def _body(report: Report) -> str:
         "</main>",
         _footer(report),
     ]
-    return "\n".join(parts)
+    return "\n".join(part for part in parts if part)
 
 
 def _summary(counts: dict) -> str:
@@ -225,7 +278,7 @@ def _details(report: Report, components: list) -> str:
         )
         kpis = (
             '<div class="kpis">'
-            f'<div class="kpi"><p class="kpi-label">Dominant · last 5 minutes</p><p class="kpi-value"><span class="num">{_text(item.dominant.text)}</span></p><p class="kpi-unit">{_text(item.dominant.label)}</p></div>'
+            f'<div class="kpi"><p class="kpi-label">Dominant · latest sample</p><p class="kpi-value"><span class="num">{_text(item.dominant.text)}</span></p><p class="kpi-unit">{_text(item.dominant.label)}</p></div>'
             f'<div class="kpi"><p class="kpi-label">Secondary</p><p class="kpi-value"><span class="num">{_text(item.secondary.text)}</span></p><p class="kpi-unit">{_text(item.secondary.label)}</p></div>'
             f'<div class="kpi"><p class="kpi-label">Also</p><p class="kpi-value"><span class="num">{_text(item.also.text)}</span></p><p class="kpi-unit">{_text(item.also.label)}</p></div>'
             "</div>"
@@ -242,6 +295,16 @@ def _details(report: Report, components: list) -> str:
 
 
 def _figure(chart: ChartView, report: Report) -> str:
+    profile = PROFILES[report.profile]
+    if chart.present == 0:
+        return (
+            '<figure class="chart">'
+            f"<figcaption><span>{_text(chart.caption)}</span>"
+            f'<span class="num">0 of {chart.expected:,} samples</span></figcaption>'
+            '<p class="chart-empty">No samples in this window, so there is nothing to draw. '
+            "Empty space would read as zero, and this is missing telemetry.</p>"
+            f'<p class="chart-note">{_text(chart.note)}</p></figure>'
+        )
     legend = []
     for index, (_key, name) in enumerate(chart.series):
         swatch = "swatch-a" if index == 0 else "swatch-b"
@@ -250,7 +313,7 @@ def _figure(chart: ChartView, report: Report) -> str:
         kind = "swatch-warn" if line["kind"] == "warn" else "swatch-crit"
         legend.append(f'<li><span class="swatch {kind}"></span>{_text(line["name"])}</li>')
     aria = (
-        f"{chart.caption}. Seven days ending {format_pt_long(report.window_end)}. "
+        f"{chart.caption}. {profile.span_label.capitalize()} ending {format_pt_long(report.window_end)}. "
         f"{chart.present:,} of {chart.expected:,} samples. "
         "Arrow keys move one bucket. Shift plus arrow moves one hour."
     )
@@ -258,7 +321,7 @@ def _figure(chart: ChartView, report: Report) -> str:
         '<figure class="chart">'
         f"<figcaption><span>{_text(chart.caption)}</span>"
         f'<span class="num">{chart.present:,} of {chart.expected:,} samples</span></figcaption>'
-        f'<p class="readout" aria-live="polite">{_text(_readout(chart, report))}</p>'
+        f'<p class="readout" aria-live="off">{_text(_readout(chart, report))}</p>'
         f'<div class="plot" tabindex="0" role="img" data-chart="{_id(chart.id)}" aria-label="{_attr(aria)}"></div>'
         f'<ul class="legend">{"".join(legend)}</ul>'
         f'<p class="chart-note">{_text(chart.note)}</p></figure>'
@@ -278,9 +341,59 @@ def _readout(chart: ChartView, report: Report) -> str:
 def _format_readout(value, fmt: str) -> str:
     if value is None:
         return "No sample"
-    from report.format import format_number
-
     return format_number(value, fmt)
+
+
+def _method_items() -> list:
+    c = catalog
+    return [
+        f"SQL and App Service plan CPU and memory: degraded at {c.CPU_WARN:g}%, critical at {c.CPU_CRIT:g}%.",
+        (
+            f"HTTP queue: degraded at {c.QUEUE_WARN:g}, critical at {c.QUEUE_CRIT:g}. "
+            "Windows sites report their own queue. Linux sites (Comvoy, locator) do not, so the App Service plan HttpQueueLength stands in."
+        ),
+        (
+            f"Server errors (5xx): responses with status 500 or higher divided by all requests, over the trailing {c.RATE_WINDOW_MINUTES} minutes. "
+            f"Degraded at {c.FAIL_WARN:g}%, critical at {c.FAIL_CRIT:g}%, only when those minutes have at least {c.MIN_REQUESTS:g} requests. "
+            "404 and other 4xx responses are not counted. The all-failures figure includes them and is not scored, because bot traffic makes 404s a large share of dealer-site requests. "
+            "Counts use sum(itemCount) on the classic requests table, filtered by cloud_RoleName where several services share a component."
+        ),
+        f"Dealer site average request duration: critical above {c.DEALER_DURATION_CRIT:,.0f} ms. p95 is shown and is not that alert.",
+        f"Azure AI Search throttled queries: critical above {c.SEARCH_THROTTLE_CRIT:g}%.",
+        "CRM container restarts: any restart in a bucket is critical.",
+        "CDC handler failures and CDC Service Bus receive errors: any count above 0 is critical.",
+        (
+            f"CDC consumer stalled: critical when data-changes received messages and delivered none over {c.CDC_STALL_MINUTES} minutes. "
+            "Topic depth is not charted."
+        ),
+        f"Notification dead letters: degraded above 0. Email scan dead letters: degraded above {c.EMAIL_DLQ_BASELINE:g}.",
+        (
+            f"Comvoy search-results failure above {c.COMVOY_SRP_FAIL_PCT:g}% for {c.COMVOY_SRP_MINUTES} minutes "
+            f"(minimum {c.COMVOY_SRP_MIN_REQUESTS:g} requests) is critical. Volume above {c.COMVOY_SRP_VOLUME:,.0f} in "
+            f"{c.COMVOY_SRP_VOLUME_MINUTES} minutes is degraded. SubmitLead failure above {c.COMVOY_LEAD_FAIL_PCT:g}% for "
+            f"{c.COMVOY_LEAD_MINUTES} minutes (minimum {c.COMVOY_LEAD_MIN_REQUESTS:g} requests) is critical. "
+            "Those lines were read from the scheduled query rules and, like the alerts, count success == false."
+        ),
+        "WebJobs request reliability stays unknown when Application Insights has too few requests to score. Platform Http5xx is a separate chart.",
+        "Exceptions per bucket are shown for the dealer site, Web API, Search API, and Comvoy. They are not scored.",
+        "A fresh measurement with no configured threshold stays unknown. It is not marked healthy. Stale or missing data stays unknown.",
+        f"Autoscale setting {c.AUTOSCALE_SETTING} is named only. Its rule body is not a threshold.",
+    ]
+
+
+def _mode_paragraph(report: Report) -> str:
+    profile = PROFILES[report.profile]
+    if profile.live:
+        return (
+            "<p>This is the live view: one-minute buckets for the last day. A local server queries Azure every minute. "
+            "Each refresh re-queries the trailing 30 minutes, keeps earlier buckets from previous queries, and re-queries the whole day hourly. "
+            "Azure Monitor trails real time by one to three minutes, so the newest buckets fill in on later refreshes. "
+            "This page checks the server every 30 seconds and replaces itself when there is new data.</p>"
+        )
+    return (
+        "<p>This is a snapshot: five-minute buckets for the last seven days, written to one file. "
+        "The file is self-contained and makes no requests when opened.</p>"
+    )
 
 
 def _footer(report: Report) -> str:
@@ -306,51 +419,42 @@ def _footer(report: Report) -> str:
         else ""
     )
     maintenance = f"<p>{_text(report.maintenance_note)}</p>" if report.maintenance_note else ""
+    items = "".join(f"<li>{_text(text)}</li>" for text in _method_items())
     return (
         '<footer class="foot"><div class="foot-inner method">'
         "<h2>How this report scores health</h2>"
-        "<p>Headline figures use the latest sample in the last 10 minutes. "
+        f"{_mode_paragraph(report)}"
+        f"<p>Headline figures use the latest sample in the last {FRESHNESS_SECONDS // 60} minutes. "
         f"The window ends {iso_utc(report.window_end)}, which is {_text(format_pt(report.window_end))}. "
         "Timestamps in the file are UTC epoch seconds. Labels use America/Los_Angeles. "
         "A missing sample is a gap. The chart does not connect across it.</p>"
-        "<ul>"
-        "<li>SQL and App Service plan CPU and memory: degraded at 70%, critical at 85%.</li>"
-        "<li>HTTP queue: degraded at 1, critical at 10.</li>"
-        "<li>Failed requests: degraded at 1%, critical at 3%, only when the 5-minute bucket has at least 50 requests. Counts use sum(itemCount) on the classic requests table.</li>"
-        "<li>Dealer site average request duration: critical above 2,000 ms. p95 is shown and is not that alert.</li>"
-        "<li>Azure AI Search throttled queries: critical above 0.1%.</li>"
-        "<li>CRM container restarts: any restart in a 5-minute bucket is critical.</li>"
-        "<li>CDC handler failures and CDC Service Bus receive errors: any count above 0 is critical.</li>"
-        "<li>CDC consumer stalled: critical when data-changes incoming is above 0 and outgoing is 0 for 15 minutes. Topic depth is not charted.</li>"
-        "<li>Notification dead letters: degraded above 0. Email scan dead letters: degraded above 4.</li>"
-        "<li>Comvoy search-results failure above 20% for 30 minutes (minimum 200 requests) is critical. Volume above 100,000 in 10 minutes is degraded. SubmitLead failure above 50% for 30 minutes (minimum 3 requests) is critical. Those lines were read from the scheduled query rules.</li>"
-        "<li>WebJobs request reliability stays unknown. Comvoy request reliability stays unknown when Application Insights has no requests. Platform Http5xx is a separate chart.</li>"
-        "<li>A fresh measurement with no configured threshold stays unknown. It is not marked healthy. Stale or missing data stays unknown.</li>"
-        f"<li>Autoscale setting {catalog_autoscale()} is named only. Its rule body is not a threshold.</li>"
-        "</ul>"
+        f"<ul>{items}</ul>"
         "<p>Dealer site requests come from Production-DealerSite in wts-prod-40. "
-        "The Application Insights component named wts-prod-dealersite in wts-prod is not queried.</p>"
+        "The Application Insights component named wts-prod-dealersite in wts-prod is not queried. "
+        "Comvoy requests come from wts-prod-searchwebapi under role comvoy-frontend-server; the component named comvoy-frontend-prod-linux receives none.</p>"
         f"{maintenance}"
         "<h2>Data quality</h2>"
         f"<ul>{quality_items}</ul>"
         f"{query_table}"
-        "<p>Schema version 1. This file is self-contained. "
-        "A later step can upload the dated file and latest.html to Azure Blob Storage. This run does not.</p>"
+        f"<p>Schema version {catalog.SCHEMA_VERSION}. "
+        + (
+            "A later step can upload the dated file and latest.html to Azure Blob Storage. This run does not."
+            if not PROFILES[report.profile].live
+            else "Nothing is stored between refreshes except the current day held in the server's memory."
+        )
+        + "</p>"
         "</div></footer>"
     )
 
 
-def catalog_autoscale() -> str:
-    from report.catalog import AUTOSCALE_SETTING
-
-    return AUTOSCALE_SETTING
-
-
 def _chart_payload(report: Report) -> dict:
+    profile = PROFILES[report.profile]
     charts = {}
     needed = set()
     for component in report.components:
         for chart in component.charts:
+            if chart.present == 0:
+                continue
             for key, _name in chart.series:
                 needed.add(key)
             if chart.volume:
@@ -376,6 +480,8 @@ def _chart_payload(report: Report) -> dict:
         "start": report.window_start,
         "step": report.step,
         "count": report.count,
+        "hour": 3600 // report.step,
+        "mode": profile.name,
         "series": series,
         "charts": charts,
         "links": links,
@@ -385,7 +491,7 @@ def _chart_payload(report: Report) -> dict:
 
 
 def _json_number(value):
-    from report.format import json_number
+    from ops_dashboard.format import json_number
 
     return json_number(value)
 

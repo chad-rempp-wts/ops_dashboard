@@ -7,24 +7,33 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, NamedTuple, Optional, Set
 
 import httpx
 from azure.identity import DefaultAzureCredential
 from azure.monitor.query import LogsQueryClient, LogsQueryStatus
 
-from report.catalog import APP_IDS, LOG_JOBS, METRIC_JOBS, LogJob, MetricJob
-from report.logs_parse import event_counts, operation_series, request_series
-from report.metrics_parse import parse_metric_payload, supported_metric_names
-from report.model import QueryRecord
-from report.queries import kql_for
-from report.series import align_map, iter_chunks, merge_timestamp_maps
-from report.window import iso_utc
+from ops_dashboard.catalog import APP_IDS, LOG_JOBS, METRIC_JOBS, LogJob, MetricJob, log_job_keys
+from ops_dashboard.logs_parse import event_counts, operation_series, request_series
+from ops_dashboard.metrics_parse import parse_metric_payload, supported_metric_names
+from ops_dashboard.model import QueryRecord
+from ops_dashboard.profile import SNAPSHOT, Profile
+from ops_dashboard.queries import kql_for
+from ops_dashboard.series import align_map, iter_chunks, merge_timestamp_maps
+from ops_dashboard.window import iso_utc
 
 METRIC_API = "2018-01-01"
 WEB_API = "2022-03-01"
 MANAGEMENT = "https://management.azure.com"
-STEP = 300
+CHUNK_SECONDS = 86400
+
+
+class Collected(NamedTuple):
+    series: Dict[str, list]
+    states: Dict[str, str]
+    queries: List[QueryRecord]
+    quality: List[str]
+    unavailable: Set[str]
 
 
 class Monitor:
@@ -61,6 +70,7 @@ class Monitor:
         raise RuntimeError(last_error)
 
     def definitions(self, resource_id: str) -> Optional[dict]:
+        """Metric names a resource defines. Cached for the life of the process."""
         with self._lock:
             if resource_id in self._definitions:
                 return self._definitions[resource_id]
@@ -77,12 +87,12 @@ class Monitor:
             self._definitions[resource_id] = found
         return found
 
-    def query_metrics(self, resource_id: str, names: List[str], aggregation: str, start: int, end: int, dimension, dimension_value) -> dict:
+    def query_metrics(self, resource_id: str, names: List[str], aggregation: str, start: int, end: int, dimension, dimension_value, interval: str = "PT5M") -> dict:
         params = {
             "api-version": METRIC_API,
             "metricnames": ",".join(names),
             "timespan": f"{iso_utc(start)}/{iso_utc(end)}",
-            "interval": "PT5M",
+            "interval": interval,
             "aggregation": aggregation,
         }
         if dimension and dimension_value:
@@ -113,26 +123,44 @@ class Monitor:
         return "unknown"
 
 
-def collect(start: int, end: int, workers: int = 4) -> tuple[dict, dict, list, list]:
-    count = (end - start) // STEP
-    credential = DefaultAzureCredential(exclude_managed_identity_credential=True)
-    monitor = Monitor(credential)
-    logs = LogsQueryClient(credential)
-    series: Dict[str, list] = {}
-    states: Dict[str, str] = {}
-    queries: List[QueryRecord] = []
-    quality: List[str] = []
-    unavailable = set()
-    tasks = []
-    try:
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+class Collector:
+    """Holds one credential and one HTTP client, so a live server reuses tokens and metric definitions."""
+
+    def __init__(self, profile: Profile = SNAPSHOT, workers: int = 4, credential=None, quiet: bool = False) -> None:
+        self.profile = profile
+        self.workers = max(1, workers)
+        self.quiet = quiet
+        credential = credential or DefaultAzureCredential(exclude_managed_identity_credential=True)
+        self._monitor = Monitor(credential)
+        self._logs = LogsQueryClient(credential)
+
+    def close(self) -> None:
+        self._monitor.close()
+
+    def __enter__(self) -> "Collector":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def collect(self, start: int, end: int) -> Collected:
+        """Query [start, end) on the profile's grid. Series are None-filled where nothing came back."""
+        step = self.profile.step
+        count = (end - start) // step
+        series: Dict[str, list] = {}
+        states: Dict[str, str] = {}
+        queries: List[QueryRecord] = []
+        quality: List[str] = []
+        unavailable: Set[str] = set()
+        outcomes = []
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
             futures = {}
             for job in METRIC_JOBS:
-                futures[pool.submit(_metric_job, monitor, job, start, end, count)] = ("metric", job.name)
+                futures[pool.submit(_metric_job, self._monitor, job, start, end, count, self.profile)] = ("metric", job.name)
             for job in LOG_JOBS:
-                futures[pool.submit(_log_job, logs, job, start, end, count)] = ("log", job.name)
+                futures[pool.submit(_log_job, self._logs, job, start, end, count, self.profile)] = ("log", job.name)
             for component_id, resource_id in APP_IDS.items():
-                futures[pool.submit(_state_job, monitor, component_id, resource_id)] = ("state", component_id)
+                futures[pool.submit(_state_job, self._monitor, component_id, resource_id)] = ("state", component_id)
             for future in as_completed(futures):
                 kind, name = futures[future]
                 try:
@@ -141,11 +169,11 @@ def collect(start: int, end: int, workers: int = 4) -> tuple[dict, dict, list, l
                     message = _short(exc)
                     quality.append(f"{name} failed: {message}")
                     queries.append(QueryRecord(name, kind, 0, "error", message))
-                    print(f"failed {name}: {message}", file=sys.stderr)
+                    self._log(f"failed {name}: {message}")
                     continue
-                tasks.append(outcome)
-                print(f"{outcome.status} {outcome.name} ({outcome.duration_ms} ms)", file=sys.stderr)
-        for outcome in tasks:
+                outcomes.append(outcome)
+                self._log(f"{outcome.status} {outcome.name} ({outcome.duration_ms} ms)")
+        for outcome in outcomes:
             queries.append(outcome.record)
             if outcome.error:
                 quality.append(f"{outcome.name}: {outcome.error}")
@@ -156,9 +184,17 @@ def collect(start: int, end: int, workers: int = 4) -> tuple[dict, dict, list, l
             else:
                 series.update(outcome.series)
                 unavailable.update(outcome.unavailable)
-    finally:
-        monitor.close()
-    return series, states, queries, quality, unavailable
+        return Collected(series, states, queries, quality, unavailable)
+
+    def _log(self, message: str) -> None:
+        if not self.quiet:
+            print(message, file=sys.stderr)
+
+
+def collect(start: int, end: int, workers: int = 4, profile: Profile = SNAPSHOT) -> Collected:
+    """One-shot collection for the snapshot report."""
+    with Collector(profile, workers) as collector:
+        return collector.collect(start, end)
 
 
 class _Outcome:
@@ -176,8 +212,9 @@ class _Outcome:
         self.record = QueryRecord(name, kind, duration_ms, status, error, detail)
 
 
-def _metric_job(monitor: Monitor, job: MetricJob, start: int, end: int, count: int) -> _Outcome:
+def _metric_job(monitor: Monitor, job: MetricJob, start: int, end: int, count: int, profile: Profile) -> _Outcome:
     started = time.perf_counter()
+    step = profile.step
     notes: List[str] = []
     defined = monitor.definitions(job.resource_id)
     lookup = {name.lower(): name for name in (defined or {})}
@@ -202,7 +239,7 @@ def _metric_job(monitor: Monitor, job: MetricJob, start: int, end: int, count: i
     def query_names(metric_names: List[str]) -> tuple:
         found: List[dict] = []
         problems: List[str] = []
-        for chunk_start, chunk_end in iter_chunks(start, end):
+        for chunk_start, chunk_end in iter_chunks(start, end, CHUNK_SECONDS):
             try:
                 payload = monitor.query_metrics(
                     job.resource_id,
@@ -212,6 +249,7 @@ def _metric_job(monitor: Monitor, job: MetricJob, start: int, end: int, count: i
                     chunk_end,
                     job.dimension,
                     job.dimension_value,
+                    profile.grain,
                 )
                 found.append(parse_metric_payload(payload, job.aggregation))
             except Exception as exc:
@@ -243,7 +281,7 @@ def _metric_job(monitor: Monitor, job: MetricJob, start: int, end: int, count: i
         merged = merge_timestamp_maps(
             [chunk.get(actual, chunk.get(spec.name, {})) for chunk in chunk_maps]
         )
-        series[spec.key] = align_map(merged, start, STEP, count)
+        series[spec.key] = align_map(merged, start, step, count)
     status = "ok"
     error = None
     if errors and chunk_maps:
@@ -252,14 +290,14 @@ def _metric_job(monitor: Monitor, job: MetricJob, start: int, end: int, count: i
     elif errors:
         status = "error"
         error = "; ".join(errors)[:500]
-    outcome = _Outcome("metric", job.name, status, _ms(started), error, notes, series, detail=job.aggregation)
+    outcome = _Outcome("metric", job.name, status, _ms(started), error, notes, series, detail=f"{job.aggregation} {profile.grain}")
     outcome.unavailable = unavailable
     return outcome
 
 
-def _log_job(logs: LogsQueryClient, job: LogJob, start: int, end: int, count: int) -> _Outcome:
+def _log_job(logs: LogsQueryClient, job: LogJob, start: int, end: int, count: int, profile: Profile) -> _Outcome:
     started = time.perf_counter()
-    kql = kql_for(job.kind, start, end)
+    kql = kql_for(job.kind, start, end, profile.step, job.role)
     last_error = "log query failed"
     response = None
     for attempt in range(3):
@@ -280,45 +318,36 @@ def _log_job(logs: LogsQueryClient, job: LogJob, start: int, end: int, count: in
                 return _Outcome("log", job.name, "error", _ms(started), last_error, series=empty)
             time.sleep(min(8, 2 ** attempt))
     rows, partial = _rows(response)
-    parsed = _parse_log(job, rows, start, count)
+    parsed = _parse_log(job, rows, start, count, profile.step)
     status = "partial" if partial else "ok"
     error = partial
-    return _Outcome("log", job.name, status, _ms(started), error, series=parsed)
+    detail = f"role {job.role}" if job.role else ""
+    return _Outcome("log", job.name, status, _ms(started), error, series=parsed, detail=detail)
 
 
-def _parse_log(job: LogJob, rows: list, start: int, count: int) -> dict:
+def _parse_log(job: LogJob, rows: list, start: int, count: int, step: int) -> dict:
     if job.kind == "requests":
-        parsed = request_series(rows, start, STEP, count)
+        parsed = request_series(rows, start, step, count)
         return {
             f"{job.prefix}Req": parsed["req"],
             f"{job.prefix}FailCount": parsed["failed"],
+            f"{job.prefix}FailAll": parsed["failed_all"],
             f"{job.prefix}Avg": parsed["avg"],
             f"{job.prefix}P95": parsed["p95"],
         }
+    if job.kind == "exceptions":
+        return {f"{job.prefix}Exc": event_counts(rows, "Count", start, step, count)}
     if job.kind == "comvoy_ops":
-        return operation_series(rows, start, STEP, count)
+        return operation_series(rows, start, step, count)
     if job.kind == "cdc_handler":
-        return {"cdcHandler": event_counts(rows, "failures", start, STEP, count)}
+        return {"cdcHandler": event_counts(rows, "failures", start, step, count)}
     if job.kind == "cdc_sb":
-        return {"cdcSb": event_counts(rows, "errors", start, STEP, count)}
+        return {"cdcSb": event_counts(rows, "errors", start, step, count)}
     return {}
 
 
 def _empty_log(job: LogJob, count: int) -> dict:
-    if job.kind == "requests":
-        return {
-            f"{job.prefix}Req": [None] * count,
-            f"{job.prefix}FailCount": [None] * count,
-            f"{job.prefix}Avg": [None] * count,
-            f"{job.prefix}P95": [None] * count,
-        }
-    if job.kind == "comvoy_ops":
-        return {key: [None] * count for key in ("srpReq", "srpFail", "leadReq", "leadFail")}
-    if job.kind == "cdc_handler":
-        return {"cdcHandler": [None] * count}
-    if job.kind == "cdc_sb":
-        return {"cdcSb": [None] * count}
-    return {}
+    return {key: [None] * count for key in log_job_keys(job)}
 
 
 def _rows(response):

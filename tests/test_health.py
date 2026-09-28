@@ -1,5 +1,5 @@
-from report.format import format_number
-from report.health import evaluate_stall, evaluate_threshold, freshest_index, rollup
+from ops_dashboard.format import format_number
+from ops_dashboard.health import evaluate_stall, evaluate_threshold, freshest_index, rollup
 
 
 def _fmt(fmt):

@@ -86,6 +86,12 @@ a { color: inherit; }
 .top-inner { display: flex; align-items: center; gap: 16px; }
 .product { margin: 0; font-weight: 650; letter-spacing: -0.02em; }
 .top-meta { margin: 0; color: var(--muted); font-size: 14px; flex: 1; }
+.live-pill { display: inline-flex; align-items: center; gap: 8px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 999px; font-size: 13px; color: var(--text); background: var(--surface); font-variant-numeric: tabular-nums; }
+.live-pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--unknown); }
+.live-pill[data-state="live"]::before { background: var(--healthy); }
+.live-pill[data-state="stale"], .live-pill[data-state="offline"] { border-color: var(--degraded); background: var(--degraded-bg); }
+.live-pill[data-state="stale"]::before, .live-pill[data-state="offline"]::before { background: var(--degraded); }
+.chart-empty { margin: 8px 0 0; padding: 14px; border: 1px dashed var(--line); border-radius: 6px; color: var(--muted); font-size: 14px; }
 button, .view-switch button {
   font: inherit;
   color: var(--text);

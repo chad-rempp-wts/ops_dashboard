@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
-from report.series import align_map, iter_chunks, merge_timestamp_maps
-from report.window import STEP_SECONDS, window_ending
+from ops_dashboard.series import align_map, iter_chunks, merge_timestamp_maps
+from ops_dashboard.window import STEP_SECONDS, window_ending
 
 
 def test_week_splits_into_seven_exact_days():

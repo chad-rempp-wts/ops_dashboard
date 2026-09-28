@@ -63,12 +63,36 @@ def align_map(points: Mapping[int, Optional[float]], start: int, step: int, coun
     return aligned
 
 
-def failure_rates(totals: Sequence[Optional[float]], failed: Sequence[Optional[float]]) -> Series:
-    """Percent failed from sampled counts. A bucket with no requests is a gap, not zero."""
+def rolling_sum(values: Sequence[Optional[float]], window: int) -> Series:
+    """Sum of the present values in the trailing window. All-missing stays missing.
+
+    With window 1 this is the series itself. Buckets before the window fills sum what exists.
+    """
+    if window <= 1:
+        return list(values)
+    result: Series = []
+    for index in range(len(values)):
+        chunk = [value for value in values[max(0, index - window + 1) : index + 1] if value is not None]
+        result.append(float(sum(chunk)) if chunk else None)
+    return result
+
+
+def failure_rates(
+    totals: Sequence[Optional[float]],
+    failed: Sequence[Optional[float]],
+    window: int = 1,
+) -> Series:
+    """Percent failed from sampled counts. A window with no requests is a gap, not zero.
+
+    window > 1 judges each bucket over the trailing window, so a one-minute bucket with
+    three requests does not swing the rate on its own.
+    """
     if len(totals) != len(failed):
         raise ValueError("totals and failed must be the same length")
+    total_sums = rolling_sum(totals, window)
+    failed_sums = rolling_sum([0.0 if t is not None and f is None else f for t, f in zip(totals, failed)], window)
     rates: Series = []
-    for total, fail in zip(totals, failed):
+    for total, fail in zip(total_sums, failed_sums):
         if total is None or total <= 0:
             rates.append(None)
             continue

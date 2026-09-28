@@ -3,6 +3,13 @@
 Non-production subscription 0aa33137-92a3-4b75-95f6-0aaccaacec7e is out of scope.
 The autoscale setting name contains 80; its rule body is not encoded.
 CDC topic depth is not queried: an unused default subscription dominates it.
+
+Request reliability is scored on server errors (5xx) only. Application Insights also marks
+404 and other 4xx responses as failed, and bot traffic makes those about 15% of dealer-site
+requests, so `success == false` is kept as an unscored fact ("all failures").
+
+Several services share one Application Insights component. Every request and exception
+query for them is filtered by cloud_RoleName (`LogJob.role`).
 """
 
 from __future__ import annotations
@@ -22,7 +29,8 @@ FAIL_CRIT = 3.0
 DEALER_DURATION_CRIT = 2000.0
 SEARCH_THROTTLE_CRIT = 0.1
 EMAIL_DLQ_BASELINE = 4.0
-CDC_STALL_BUCKETS = 3
+CDC_STALL_MINUTES = 15
+RATE_WINDOW_MINUTES = 5
 
 # Comvoy scheduled-query rules read 2026-09-28 from resource group wts-prod.
 # Severity 0 is critical. Severity 2 is degraded. Operators are GreaterThan.
@@ -53,11 +61,18 @@ WEBAPI_PLAN = arm("wts-prod", "Microsoft.Web/serverFarms/wts-prod-app-svc-plan")
 WEBAPI_AI = arm("wts-prod-rg", "microsoft.insights/components/wtsWebApi-AppInsights")
 SEARCH_SITE = arm("wts-prod", "Microsoft.Web/sites/wts-prod-searchwebapi")
 SEARCH_AI = arm("wts-prod", "microsoft.insights/components/wts-prod-searchwebapi")
+# Comvoy telemetry lands in the search API's component under its own role name.
+# The component named comvoy-frontend-prod-linux exists and receives nothing.
+COMVOY_AI = SEARCH_AI
+
+ROLE_DEALER = "wts-prod-dealersite"
+ROLE_WEBAPI = "wts-prod-webapi"
+ROLE_SEARCH = "wts-search-webapi"
+ROLE_COMVOY = "comvoy-frontend-server"
 TOOLS_SITE = arm("wts-prod", "Microsoft.Web/sites/wts-prod-dealertoolswebapi")
 TOOLS_AI = arm("wts-prod", "microsoft.insights/components/wts-prod-dealertoolswebapi")
 COMVOY_SITE = arm("wts-prod", "Microsoft.Web/sites/comvoy-frontend-prod-linux")
 COMVOY_PLAN = arm("wts-prod", "Microsoft.Web/serverFarms/comvoy-frontend-prod-linux")
-COMVOY_AI = arm("wts-prod", "microsoft.insights/components/comvoy-frontend-prod-linux")
 LOCATOR_SITE = arm("wts-prod", "Microsoft.Web/sites/wts-prod-locator-frontend")
 LOCATOR_AI = arm("wts-prod", "microsoft.insights/components/wts-prod-locator-frontend")
 WEBJOBS_SITE = arm("wts-prod", "Microsoft.Web/sites/wts-prod-webjobs")
@@ -108,6 +123,8 @@ class LogJob:
     resource_id: str
     kind: str
     prefix: str
+    # cloud_RoleName filter for components that several services report into.
+    role: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +158,8 @@ class ChartSpec:
     scale: str = "auto"
     volume: Optional[str] = None
     sum_series: bool = False
+    # When set, the axis stops at this quantile of the data so rare spikes do not flatten the line.
+    cap_quantile: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -155,7 +174,7 @@ class Component:
     resource: str
     share: Optional[str] = None
     mode: str = "rules"  # rules | unthresholded | absent
-    reliability: str = "score"  # score | sparse | empty
+    reliability: str = "score"  # score | sparse
     request_series: Optional[str] = None
     rules: Tuple[ThresholdRule, ...] = ()
     displays: Tuple[Display, ...] = ()
@@ -220,7 +239,14 @@ METRIC_JOBS: Tuple[MetricJob, ...] = (
     ),
     MetricJob("Dealer App Service plan", DEALER_PLAN, "Average", _plan_metrics("plan")),
     MetricJob("Web API App Service plan", WEBAPI_PLAN, "Average", _plan_metrics("appPlan")),
-    MetricJob("Comvoy App Service plan", COMVOY_PLAN, "Average", _plan_metrics("comvoyPlan")),
+    # Linux App Service does not expose RequestsInApplicationQueue on the site.
+    # The plan's HttpQueueLength is the queue signal for Comvoy and the locator.
+    MetricJob(
+        "Comvoy App Service plan",
+        COMVOY_PLAN,
+        "Average",
+        (*_plan_metrics("comvoyPlan"), MetricSpec("comvoyPlanQueue", "HttpQueueLength", False)),
+    ),
     MetricJob("Tracker App Service plan", TRACKER_PLAN, "Average", _plan_metrics("trackerPlan")),
     MetricJob("Email App Service plan", EMAIL_PLAN, "Average", _plan_metrics("emailPlan")),
     MetricJob("Dealer site platform", DEALER_SITE, "Total", (MetricSpec("dealerHttp5xx", "Http5xx"),)),
@@ -256,14 +282,14 @@ METRIC_JOBS: Tuple[MetricJob, ...] = (
         "Comvoy platform averages",
         COMVOY_SITE,
         "Average",
-        (MetricSpec("comvoyHttpRt", "HttpResponseTime"), MetricSpec("comvoyQueue", "RequestsInApplicationQueue")),
+        (MetricSpec("comvoyHttpRt", "HttpResponseTime"),),
     ),
     MetricJob("Locator platform", LOCATOR_SITE, "Total", (MetricSpec("locatorHttp5xx", "Http5xx"),)),
     MetricJob(
         "Locator platform averages",
         LOCATOR_SITE,
         "Average",
-        (MetricSpec("locatorHttpRt", "HttpResponseTime"), MetricSpec("locatorQueue", "RequestsInApplicationQueue")),
+        (MetricSpec("locatorHttpRt", "HttpResponseTime"),),
     ),
     MetricJob("WebJobs platform", WEBJOBS_SITE, "Total", (MetricSpec("webjobsHttp5xx", "Http5xx"),)),
     MetricJob(
@@ -377,11 +403,15 @@ METRIC_JOBS: Tuple[MetricJob, ...] = (
 )
 
 LOG_JOBS: Tuple[LogJob, ...] = (
-    LogJob("Dealer site requests", DEALER_AI, "requests", "dealer"),
-    LogJob("Web API requests", WEBAPI_AI, "requests", "webapi"),
-    LogJob("Search API requests", SEARCH_AI, "requests", "searchapi"),
+    LogJob("Dealer site requests", DEALER_AI, "requests", "dealer", ROLE_DEALER),
+    LogJob("Web API requests", WEBAPI_AI, "requests", "webapi", ROLE_WEBAPI),
+    LogJob("Search API requests", SEARCH_AI, "requests", "searchapi", ROLE_SEARCH),
     LogJob("Dealer-tools requests", TOOLS_AI, "requests", "tools"),
-    LogJob("Comvoy requests", COMVOY_AI, "requests", "comvoy"),
+    LogJob("Comvoy requests", COMVOY_AI, "requests", "comvoy", ROLE_COMVOY),
+    LogJob("Dealer site exceptions", DEALER_AI, "exceptions", "dealer", ROLE_DEALER),
+    LogJob("Web API exceptions", WEBAPI_AI, "exceptions", "webapi", ROLE_WEBAPI),
+    LogJob("Search API exceptions", SEARCH_AI, "exceptions", "searchapi", ROLE_SEARCH),
+    LogJob("Comvoy exceptions", COMVOY_AI, "exceptions", "comvoy", ROLE_COMVOY),
     LogJob("Locator requests", LOCATOR_AI, "requests", "locator"),
     LogJob("WebJobs requests", WEBJOBS_AI, "requests", "webjobs"),
     LogJob("Tracker requests", TRACKER_AI, "requests", "tracker"),
@@ -440,17 +470,17 @@ LAYERS = (
 )
 
 _FAIL_NOTE = (
-    "Scored only when the 5-minute bucket has at least 50 requests. "
-    "Gaps are missing samples, not zero."
+    "5xx responses divided by all requests, over the trailing 5 minutes. 404 and other 4xx are not counted. "
+    "Scored only when those 5 minutes have at least 50 requests. Gaps are missing samples, not zero."
 )
 
 
 def _fail_chart(prefix: str, title: str) -> ChartSpec:
     return ChartSpec(
         f"{prefix}Rate",
-        f"{title} failed-request percent",
+        f"{title} server-error (5xx) percent",
         "pct2",
-        ((f"{prefix}Rate", "Failed requests"),),
+        ((f"{prefix}Rate", "Server errors (5xx)"),),
         _FAIL_NOTE,
         volume=f"{prefix}Req",
     )
@@ -491,12 +521,12 @@ COMPONENTS: Tuple[Component, ...] = (
         request_series="dealerReq",
         app_id=DEALER_SITE,
         rules=(
-            _fail("dealerRate", "dealerReq", "Failed requests"),
+            _fail("dealerRate", "dealerReq", "Server errors (5xx)"),
             _queue("dealerQueue", "HTTP queue"),
             ThresholdRule("dealerAvg", "Average request duration", "ms", None, DEALER_DURATION_CRIT, "gt"),
         ),
         displays=(
-            Display("dealerRate", "pct2", "failed requests", "last"),
+            Display("dealerRate", "pct2", "server errors (5xx)", "last"),
             Display("dealerReq", "int", "requests / 5 min", "last"),
             Display("dealerAvg", "ms", "average duration", "last"),
         ),
@@ -505,6 +535,8 @@ COMPONENTS: Tuple[Component, ...] = (
             Display("dealerQueue", "int", "HTTP queue", "last"),
             Display("dealerHttp5xx", "int", "platform Http5xx", "last"),
             Display("planCpu", "pct1", "shared plan CPU", "last"),
+            Display("dealerRateAll", "pct2", "all failures incl. 404, not scored", "last"),
+            Display("dealerExc", "int", "exceptions / 5 min", "last"),
         ),
         charts=(
             _fail_chart("dealer", "Dealer site"),
@@ -514,6 +546,7 @@ COMPONENTS: Tuple[Component, ...] = (
                 "ms",
                 (("dealerAvg", "Average duration"), ("dealerP95", "p95 duration")),
                 "Critical line is the average-duration alert at 2,000 ms. p95 is shown and is not the scored line. Gaps match missing request buckets.",
+                cap_quantile=0.98,
             ),
         ),
     ),
@@ -521,31 +554,36 @@ COMPONENTS: Tuple[Component, ...] = (
         "comvoy", "Comvoy frontend", "Presentation", 3, "wts", "svelte", "SvelteKit",
         "comvoy-frontend-prod-linux",
         share=SHARE_COMVOY_PLAN,
-        reliability="empty",
+        reliability="score",
         request_series="comvoyReq",
         app_id=COMVOY_SITE,
         rules=(
+            _fail("comvoyRate", "comvoyReq", "Server errors (5xx)"),
             _cpu("comvoyPlanCpu", "Comvoy plan CPU"),
             _mem("comvoyPlanMem", "Comvoy plan memory"),
-            _queue("comvoyQueue", "HTTP queue"),
+            _queue("comvoyPlanQueue", "Plan HTTP queue"),
         ),
         displays=(
-            Display("comvoyHttp5xx", "int", "Http5xx / 5 min", "last"),
-            Display("comvoyReq", "int", "Application Insights requests", "sum"),
+            Display("comvoyRate", "pct2", "server errors (5xx)", "last"),
+            Display("comvoyReq", "int", "requests / 5 min", "last"),
             Display("comvoyPlanCpu", "pct1", "plan CPU", "last"),
         ),
         facts=(
+            Display("comvoyHttp5xx", "int", "platform Http5xx", "last"),
             Display("comvoyPlanMem", "pct1", "plan memory", "last"),
-            Display("comvoyQueue", "int", "HTTP queue", "last"),
+            Display("comvoyPlanQueue", "int", "plan HTTP queue", "last"),
             Display("comvoyHttpRt", "ms", "platform response", "last"),
+            Display("comvoyRateAll", "pct2", "all failures incl. 404, not scored", "last"),
+            Display("comvoyExc", "int", "exceptions / 5 min", "last"),
         ),
         charts=(
+            _fail_chart("comvoy", "Comvoy frontend"),
             ChartSpec(
                 "comvoy5xx",
                 "Comvoy platform Http5xx count",
                 "int",
                 (("comvoyHttp5xx", "Http5xx"),),
-                "App Service platform metric. Application Insights request reliability is unknown when the component has no requests. Http5xx has no separate threshold.",
+                "App Service platform metric, counted by the platform rather than by Application Insights. It has no separate threshold.",
             ),
         ),
     ),
@@ -556,15 +594,16 @@ COMPONENTS: Tuple[Component, ...] = (
         reliability="score",
         request_series="locatorReq",
         app_id=LOCATOR_SITE,
-        rules=(_fail("locatorRate", "locatorReq", "Failed requests"), _queue("locatorQueue", "HTTP queue")),
+        rules=(_fail("locatorRate", "locatorReq", "Server errors (5xx)"), _queue("comvoyPlanQueue", "Plan HTTP queue")),
         displays=(
-            Display("locatorRate", "pct2", "failed requests", "last"),
+            Display("locatorRate", "pct2", "server errors (5xx)", "last"),
             Display("locatorReq", "int", "requests / 5 min", "last"),
             Display("comvoyPlanCpu", "pct1", "shared plan CPU", "last"),
         ),
         facts=(
             Display("locatorHttp5xx", "int", "platform Http5xx", "last"),
-            Display("locatorQueue", "int", "HTTP queue", "last"),
+            Display("comvoyPlanQueue", "int", "shared plan HTTP queue", "last"),
+            Display("locatorRateAll", "pct2", "all failures incl. 404, not scored", "last"),
         ),
         charts=(_fail_chart("locator", "Locator"),),
     ),
@@ -575,13 +614,13 @@ COMPONENTS: Tuple[Component, ...] = (
         request_series="webapiReq",
         app_id=WEBAPI_SITE,
         rules=(
-            _fail("webapiRate", "webapiReq", "Failed requests"),
+            _fail("webapiRate", "webapiReq", "Server errors (5xx)"),
             _queue("webapiQueue", "HTTP queue"),
             _cpu("appPlanCpu", "Shared plan CPU"),
             _mem("appPlanMem", "Shared plan memory"),
         ),
         displays=(
-            Display("webapiRate", "pct2", "failed requests", "last"),
+            Display("webapiRate", "pct2", "server errors (5xx)", "last"),
             Display("webapiReq", "int", "requests / 5 min", "last"),
             Display("appPlanCpu", "pct1", "plan CPU", "last"),
         ),
@@ -590,6 +629,8 @@ COMPONENTS: Tuple[Component, ...] = (
             Display("webapiQueue", "int", "HTTP queue", "last"),
             Display("webapiHttp5xx", "int", "platform Http5xx", "last"),
             Display("appPlanMem", "pct1", "plan memory", "last"),
+            Display("webapiRateAll", "pct2", "all failures incl. 404, not scored", "last"),
+            Display("webapiExc", "int", "exceptions / 5 min", "last"),
         ),
         charts=(_fail_chart("webapi", "Web API"),),
     ),
@@ -600,11 +641,11 @@ COMPONENTS: Tuple[Component, ...] = (
         request_series="searchapiReq",
         app_id=SEARCH_SITE,
         rules=(
-            _fail("searchapiRate", "searchapiReq", "Failed requests"),
+            _fail("searchapiRate", "searchapiReq", "Server errors (5xx)"),
             _queue("searchapiQueue", "HTTP queue"),
         ),
         displays=(
-            Display("searchapiRate", "pct2", "failed requests", "last"),
+            Display("searchapiRate", "pct2", "server errors (5xx)", "last"),
             Display("searchapiReq", "int", "requests / 5 min", "last"),
             Display("planCpu", "pct1", "shared plan CPU", "last"),
         ),
@@ -612,6 +653,8 @@ COMPONENTS: Tuple[Component, ...] = (
             Display("searchapiP95", "ms", "p95 duration", "last"),
             Display("searchapiQueue", "int", "HTTP queue", "last"),
             Display("searchapiHttp5xx", "int", "platform Http5xx", "last"),
+            Display("searchapiRateAll", "pct2", "all failures incl. 404, not scored", "last"),
+            Display("searchapiExc", "int", "exceptions / 5 min", "last"),
         ),
         charts=(_fail_chart("searchapi", "Search API"),),
     ),
@@ -621,9 +664,9 @@ COMPONENTS: Tuple[Component, ...] = (
         share=SHARE_DEALER_PLAN,
         request_series="toolsReq",
         app_id=TOOLS_SITE,
-        rules=(_fail("toolsRate", "toolsReq", "Failed requests"), _queue("toolsQueue", "HTTP queue")),
+        rules=(_fail("toolsRate", "toolsReq", "Server errors (5xx)"), _queue("toolsQueue", "HTTP queue")),
         displays=(
-            Display("toolsRate", "pct2", "failed requests", "last"),
+            Display("toolsRate", "pct2", "server errors (5xx)", "last"),
             Display("toolsReq", "int", "requests / 5 min", "last"),
             Display("planCpu", "pct1", "shared plan CPU", "last"),
         ),
@@ -631,6 +674,7 @@ COMPONENTS: Tuple[Component, ...] = (
             Display("toolsP95", "ms", "p95 duration", "last"),
             Display("toolsQueue", "int", "HTTP queue", "last"),
             Display("toolsHttp5xx", "int", "platform Http5xx", "last"),
+            Display("toolsRateAll", "pct2", "all failures incl. 404, not scored", "last"),
         ),
         charts=(_fail_chart("tools", "Dealer-tools API"),),
     ),
@@ -698,10 +742,10 @@ COMPONENTS: Tuple[Component, ...] = (
         rules=(
             _cpu("trackerPlanCpu", "Tracker plan CPU"),
             _mem("trackerPlanMem", "Tracker plan memory"),
-            _fail("trackerRate", "trackerReq", "Failed requests"),
+            _fail("trackerRate", "trackerReq", "Server errors (5xx)"),
         ),
         displays=(
-            Display("trackerRate", "pct2", "failed requests", "last"),
+            Display("trackerRate", "pct2", "server errors (5xx)", "last"),
             Display("trackerReq", "int", "requests / 5 min", "last"),
             Display("trackerPlanCpu", "pct1", "plan CPU", "last"),
         ),
@@ -919,6 +963,13 @@ RATE_PAIRS = (
     ("trackerRate", "trackerReq", "trackerFailCount"),
     ("emailRate", "emailReq", "emailFailCount"),
     ("gwRate", "gwTotal", "gwFail"),
+    # Unscored context: everything Application Insights marks as failed, including 404.
+    ("dealerRateAll", "dealerReq", "dealerFailAll"),
+    ("webapiRateAll", "webapiReq", "webapiFailAll"),
+    ("searchapiRateAll", "searchapiReq", "searchapiFailAll"),
+    ("toolsRateAll", "toolsReq", "toolsFailAll"),
+    ("comvoyRateAll", "comvoyReq", "comvoyFailAll"),
+    ("locatorRateAll", "locatorReq", "locatorFailAll"),
 )
 
 
@@ -930,24 +981,31 @@ def metric_keys() -> Tuple[str, ...]:
     return tuple(keys)
 
 
+def log_job_keys(job: LogJob) -> Tuple[str, ...]:
+    """Series keys a log job produces. Also the shape of an empty result."""
+    if job.kind == "requests":
+        return (
+            f"{job.prefix}Req",
+            f"{job.prefix}FailCount",
+            f"{job.prefix}FailAll",
+            f"{job.prefix}Avg",
+            f"{job.prefix}P95",
+        )
+    if job.kind == "exceptions":
+        return (f"{job.prefix}Exc",)
+    if job.kind == "comvoy_ops":
+        return ("srpReq", "srpFail", "leadReq", "leadFail")
+    if job.kind == "cdc_handler":
+        return ("cdcHandler",)
+    if job.kind == "cdc_sb":
+        return ("cdcSb",)
+    return ()
+
+
 def log_series_keys() -> Tuple[str, ...]:
     keys = []
     for job in LOG_JOBS:
-        if job.kind == "requests":
-            keys.extend(
-                [
-                    f"{job.prefix}Req",
-                    f"{job.prefix}FailCount",
-                    f"{job.prefix}Avg",
-                    f"{job.prefix}P95",
-                ]
-            )
-        elif job.kind == "comvoy_ops":
-            keys.extend(["srpReq", "srpFail", "leadReq", "leadFail"])
-        elif job.kind == "cdc_handler":
-            keys.append("cdcHandler")
-        elif job.kind == "cdc_sb":
-            keys.append("cdcSb")
+        keys.extend(log_job_keys(job))
     return tuple(keys)
 
 

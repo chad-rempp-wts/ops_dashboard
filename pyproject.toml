@@ -1,7 +1,7 @@
 [project]
-name = "daily-system-report"
-version = "1.0.0"
-description = "Read-only daily production systems report as one standalone HTML file"
+name = "ops-dashboard"
+version = "2.0.0"
+description = "Read-only production ops dashboard: a standalone HTML snapshot and a live local view"
 requires-python = ">=3.9"
 dependencies = [
     "azure-identity>=1.17,<2",
@@ -10,8 +10,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+live = [
+    "fastapi>=0.110,<1",
+    "uvicorn>=0.29,<1",
+]
 dev = [
     "pytest>=8,<9",
+    "fastapi>=0.110,<1",
+    "uvicorn>=0.29,<1",
 ]
 
 [build-system]
@@ -19,10 +25,10 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["report*"]
+include = ["ops_dashboard*"]
 
 [tool.setuptools.package-data]
-report = ["assets/*"]
+ops_dashboard = ["assets/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

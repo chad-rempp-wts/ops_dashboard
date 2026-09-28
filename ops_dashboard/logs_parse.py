@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, List, Optional, Sequence
 
-from report.metrics_parse import parse_timestamp
-from report.series import Series, align_map, zero_fill
+from ops_dashboard.metrics_parse import parse_timestamp
+from ops_dashboard.series import Series, align_map, zero_fill
 
 
 def _bucket_maps(rows: Iterable[dict], value_fields: Sequence[str]) -> Dict[str, Dict[int, Optional[float]]]:
@@ -27,7 +27,8 @@ def _bucket_maps(rows: Iterable[dict], value_fields: Sequence[str]) -> Dict[str,
 
 
 def request_series(rows: Iterable[dict], start: int, step: int, count: int) -> Dict[str, Series]:
-    maps = _bucket_maps(rows, ("Total", "Failed", "AvgMs", "P95Ms"))
+    rows = list(rows)
+    maps = _bucket_maps(rows, ("Total", "Failed", "FailedAll", "AvgMs", "P95Ms"))
     # Duration is not additive. Keep the last observed value when buckets collide.
     for field in ("AvgMs", "P95Ms"):
         collapsed: Dict[int, Optional[float]] = {}
@@ -39,6 +40,7 @@ def request_series(rows: Iterable[dict], start: int, step: int, count: int) -> D
     return {
         "req": align_map(maps["Total"], start, step, count),
         "failed": align_map(maps["Failed"], start, step, count),
+        "failed_all": align_map(maps["FailedAll"], start, step, count),
         "avg": align_map(maps["AvgMs"], start, step, count),
         "p95": align_map(maps["P95Ms"], start, step, count),
     }

@@ -1,5 +1,5 @@
-from report.catalog import LOG_JOBS, METRIC_JOBS, DEALER_AI
-from report.queries import cdc_handler_kql, requests_kql
+from ops_dashboard.catalog import COMVOY_AI, DEALER_AI, LOG_JOBS, METRIC_JOBS, ROLE_COMVOY, SEARCH_AI
+from ops_dashboard.queries import cdc_handler_kql, exceptions_kql, kql_for, requests_kql
 
 
 def test_requests_query_uses_sampled_counts_and_a_time_grid():
@@ -35,3 +35,41 @@ def test_cdc_topic_depth_is_not_queried():
             assert "DeadletteredMessages" not in names
             assert "IncomingMessages" in names
             assert "OutgoingMessages" in names
+
+
+def test_failures_are_5xx_and_all_failures_are_kept_separately():
+    query = requests_kql(0, 3000)
+    assert "toint(resultCode) >= 500" in query
+    assert "FailedAll = sumif(itemCount, success == false)" in query
+
+
+def test_one_minute_grid_uses_the_step():
+    assert "step 1m" in requests_kql(0, 3000, step=60)
+    assert "bin(timestamp, 1m)" in exceptions_kql(0, 3000, step=60)
+    assert "step 5m" in kql_for("requests", 0, 3000)
+
+
+def test_role_scoping_filters_and_rejects_unsafe_names():
+    query = requests_kql(0, 3000, role=ROLE_COMVOY)
+    assert f'| where cloud_RoleName == "{ROLE_COMVOY}"' in query
+    assert "cloud_RoleName" not in requests_kql(0, 3000)
+    try:
+        requests_kql(0, 3000, role='x" or 1==1 //')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unsafe role name accepted")
+
+
+def test_comvoy_reads_the_search_api_component_by_role():
+    assert COMVOY_AI == SEARCH_AI
+    job = next(item for item in LOG_JOBS if item.name == "Comvoy requests")
+    assert job.resource_id == SEARCH_AI
+    assert job.role == ROLE_COMVOY
+
+
+def test_linux_sites_use_the_plan_queue_metric():
+    names = [spec.name for job in METRIC_JOBS for spec in job.metrics]
+    assert "HttpQueueLength" in names
+    keys = [spec.key for job in METRIC_JOBS for spec in job.metrics]
+    assert "comvoyPlanQueue" in keys

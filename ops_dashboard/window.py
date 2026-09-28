@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
 
-STEP_SECONDS = 300
-BUCKETS_PER_WEEK = 7 * 24 * 12  # 2016
+from ops_dashboard.profile import SNAPSHOT, Profile
+
+STEP_SECONDS = SNAPSHOT.step
+BUCKETS_PER_WEEK = SNAPSHOT.count  # 2016
 DAY_SECONDS = 86400
 PACIFIC = ZoneInfo("America/Los_Angeles")
 
@@ -30,16 +33,20 @@ def parse_end(text: str) -> int:
     return int(parsed.timestamp())
 
 
-def window_ending(end_epoch: int | None = None, now: datetime | None = None) -> tuple[int, int]:
-    """Return [start, end) ending at the latest completed five-minute boundary."""
+def window_ending(
+    end_epoch: Optional[int] = None,
+    now: Optional[datetime] = None,
+    profile: Profile = SNAPSHOT,
+) -> Tuple[int, int]:
+    """Return [start, end) ending at the latest completed bucket boundary of the profile."""
     if end_epoch is None:
         moment = now if now is not None else datetime.now(timezone.utc)
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=timezone.utc)
-        end_epoch = floor_step(int(moment.timestamp()))
+        end_epoch = floor_step(int(moment.timestamp()), profile.step)
     else:
-        end_epoch = floor_step(int(end_epoch))
-    start = end_epoch - BUCKETS_PER_WEEK * STEP_SECONDS
+        end_epoch = floor_step(int(end_epoch), profile.step)
+    start = end_epoch - profile.count * profile.step
     return start, end_epoch
 
 
@@ -52,6 +59,11 @@ def format_pt(epoch: int) -> str:
     weekday = _WEEKDAYS[moment.weekday()]
     month = _MONTHS[moment.month - 1]
     return f"{weekday} {month} {moment.day}, {moment.hour:02d}:{moment.minute:02d} PT"
+
+
+def format_pt_clock(epoch: int) -> str:
+    moment = datetime.fromtimestamp(epoch, PACIFIC)
+    return f"{moment.hour:02d}:{moment.minute:02d}:{moment.second:02d} PT"
 
 
 def format_pt_date(epoch: int) -> str:
