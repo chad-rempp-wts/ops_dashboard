@@ -1,0 +1,28 @@
+[project]
+name = "daily-system-report"
+version = "1.0.0"
+description = "Read-only daily production systems report as one standalone HTML file"
+requires-python = ">=3.9"
+dependencies = [
+    "azure-identity>=1.17,<2",
+    "azure-monitor-query>=1.4,<2",
+    "httpx>=0.27,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["report*"]
+
+[tool.setuptools.package-data]
+report = ["assets/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
